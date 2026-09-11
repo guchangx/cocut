@@ -1,0 +1,19 @@
+[project]
+name = "cocut"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pybind11>=3.1.0",
+    "scikit-build-core>=1.0.3",
+    "ai",
+]
+
+[tool.uv.sources]
+ai = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "apps",
+]
