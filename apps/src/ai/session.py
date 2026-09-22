@@ -1,6 +1,10 @@
-from typing import Generator
+from typing import Generator, Any
+from openai.types.responses import Response
 from ai.client import Client
+from ai.message import Message
 from ai.tools import ai_call_tool
+from ai.tracing import tracer
+
 
 COCUT_SYSTEM_PROMPT = """你是一个资深的视觉工作者、专业修图师与电影级剪辑师、具有极高的审美品位（名字叫 Cocut）。
 你的使命是指导并协助用户，你通过摄影美学，科学后期与视听叙事，将日常“随手拍”的普通照片和零碎视频，蜕变成具有高级质感、电影情绪和传播感染力的视觉作品。
@@ -41,114 +45,208 @@ class Session:
     def __init__(self, client: Client | None = None, system_prompt: str = COCUT_SYSTEM_PROMPT):
         self.client = client or Client()
         self.system_prompt = system_prompt
-        self.messages: list[dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
+        self.last_response_id: str | None = None
+        self.messages: list[Message] = []
         self.reset()
 
-    def reset(self) ->None:
-        self.messages = [{"role": "system", "content": self.system_prompt}]
+    def reset(self) -> None:
+        self.last_response_id = None
+        self.messages = []
+
+    def clear(self) -> None:
+        self.reset()
+
+    def get_context_messages(self) -> list[dict[str, Any]]:
+        """获取纯字典格式的消息列表，供不支持 response_id 的模型传递完整上下文"""
+        return [item.message for item in self.messages]
+
+    def _extract_text(self, resp: Response) -> str:
+        """从 Response 结构体中提取所有的助手文本回答"""
+        texts: list[str] = []
+        for item in getattr(resp, "output", []) or []:
+            if getattr(item, "type", None) == "message":
+                for part in getattr(item, "content", []) or []:
+                    if getattr(part, "type", None) == "output_text":
+                        texts.append(getattr(part, "text", ""))
+                    elif hasattr(part, "text"):
+                        texts.append(str(part.text))
+        if not texts and hasattr(resp, "content") and resp.content:
+            texts.append(str(resp.content))
+        return "".join(texts)
+
+    def _process_tools_and_respond(self, completed_resp: Response) -> Generator[str, None, None]:
+        tool_calls = [
+            item for item in (completed_resp.output or [])
+            if getattr(item, "type", None) == "function_call"
+        ]
+
+        # if no tool calls, indicate handle complete.
+        if not tool_calls:
+            content = self._extract_text(completed_resp)
+            if content and content.strip():
+                self.messages.append(
+                    Message(
+                        id=getattr(completed_resp, "id", None),
+                        role="assistant",
+                        content=content,
+                    )
+                )
+            return
+
+        content = self._extract_text(completed_resp)
+        if content and content.strip():
+            self.messages.append(
+                Message(
+                    id=getattr(completed_resp, "id", None),
+                    role="assistant",
+                    content=content,
+                )
+            )
+
+        # tools call should add in memory
+        for tool in tool_calls:
+            self.messages.append(
+                Message(
+                    id=tool.call_id,
+                    message={
+                        "type": "function_call",
+                        "call_id": tool.call_id,
+                        "name": tool.name,
+                        "arguments": tool.arguments,
+                    },
+                )
+            )
+
+        # 2. use tools
+        executed_tools = []
+        for tool in tool_calls:
+            tool_dict = {
+                "name": tool.name,
+                "arguments": tool.arguments,
+            }
+            res = ai_call_tool(tool_dict)
+            executed_tools.append((tool, res))
+
+        # 3. tools call result should add in memeory
+        for tool, res in executed_tools:
+            self.messages.append(
+                Message(
+                    id=tool.call_id,
+                    message={
+                        "type": "function_call_output",
+                        "call_id": tool.call_id,
+                        "output": str(res),
+                    },
+                )
+            )
+
+        next_completed: Response | None = None
+        with tracer.span("LLM-Tool-Feedback-Phase"):
+            #support previous response id
+            if self.client.capabilities.support_response_id:
+                tool_outputs = [
+                    {
+                        "type": "function_call_output",
+                        "call_id": tool.call_id,
+                        "output": str(res),
+                    }
+                    for tool, res in executed_tools
+                ]
+                stream_gen = self.client.create_response(
+                    input_items=tool_outputs,
+                    previous_response_id=completed_resp.id,
+                )
+            #not support previous response id
+            else:
+                stream_gen = self.client.create_response(
+                    input_items=self.messages,
+                    instructions=self.system_prompt,
+                    previous_response_id=None,
+                )
+
+            for event_type, chunk in stream_gen:
+                if event_type == "text":
+                    yield chunk
+                elif event_type == "completed":
+                    next_completed = chunk
+
+        if next_completed:
+            if self.client.capabilities.support_response_id and getattr(next_completed, "id", None):
+                self.last_response_id = next_completed.id
+            yield from self._process_tools_and_respond(next_completed)
 
     def stream(self, input: str) -> Generator[str, None, None]:
-        self.messages.append({"role": "user", "content": input})
+        user_msg = Message(id=None, role="user", content=input)
+        self.messages.append(user_msg)
 
-        reply = []
-        try: 
-            for chunk in self.client.chat(self.messages):
-                reply.append(chunk)
-                yield chunk
-        except Exception as e:
-            self.messages.pop()
-            raise e
+        completed_resp: Response | None = None
+        with tracer.span("LLM-Reasoning-Phase"):
+            if self.client.capabilities.support_response_id:
+                stream_gen = self.client.create_response(
+                    input_items=[user_msg],
+                    instructions=self.system_prompt,
+                    previous_response_id=self.last_response_id,
+                )
+            else:
+                stream_gen = self.client.create_response(
+                    input_items=self.messages,
+                    instructions=self.system_prompt,
+                    previous_response_id=None,
+                )
 
-        self.messages.append({"role": "assistant", "content": "".join(reply)})
+            for event_type, chunk in stream_gen:
+                if event_type == "text":
+                    yield chunk
+                elif event_type == "completed":
+                    completed_resp = chunk
 
-    def stream_with_image(self, input: str, imagepath: str):
+        # 走出 LLM-Reasoning-Phase 之后再进入工具处理，确保阶段 1 先于阶段 2 结束
+        if completed_resp:
+            if self.client.capabilities.support_response_id and getattr(completed_resp, "id", None):
+                self.last_response_id = completed_resp.id
+            yield from self._process_tools_and_respond(completed_resp)
+
+    def stream_with_image(self, input: str, imagepath: str) -> Generator[str, None, None]:
         import os
         from ai.tools import encode_image_to_base64
 
         data = encode_image_to_base64(imagepath)
         ext = os.path.splitext(imagepath)[1].lower().replace(".", "")
-        type = "jpeg" if ext in ("jpg", "jpeg") else ext
+        mime_type = "jpeg" if ext in ("jpg", "jpeg") else ext
 
-        content = {
-            "role": "user",
-            "content": [
-                {"type":"text", "text": input},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/{type};base64,{data}"}
-                }
-            ]
-        }
-        
+        user_content = [
+            {"type": "input_text", "text": input},
+            {
+                "type": "input_image",
+                "image_url": f"data:image/{mime_type};base64,{data}",
+            },
+        ]
+        user_msg = Message(id=None, role="user", content=user_content)
+        self.messages.append(user_msg)
 
-        self.messages.append(content)
-
-        reply = []
-        tools: dict[int, dict] = {}
-        try:
-            for type, chunk in self.client.chat(self.messages):
-                if type == "text":
-                    reply.append(chunk)
-                    yield chunk
-                elif type == "tool":
-                    for tool in chunk:
-                        index = tool.index
-                        id = tool.id
-                        name = tool.function.name
-                        arguments = tool.function.arguments
-                        type = tool.type
-
-                        if index not in tools:  
-                            tools[index] = {
-                                "id": id,
-                                "name": name,
-                                "type": type,
-                                "arguments": arguments,
-                            }
-                        else:
-                            tools[index]["arguments"] += arguments
-                    
-            if tools:
-                assistant_tool_calls = [
-                    {
-                        "id": v["id"],
-                        "type": "function",
-                        "function": {"name": v["name"], "arguments": v["arguments"]}
-                    }
-                    for v in tools.values()
-                ]
-
-                self.messages.append({
-                    "role": "assistant",
-                    "content": "".join(reply) if reply else None,
-                    "tool_calls": assistant_tool_calls
-                })
-                                    
-                for key, value in tools.items():
-                    print(f"value: {value}")
-                    res = ai_call_tool(value)
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": value["id"],
-                        "content": str(res)
-                    })
-
-                final = []
-                for event_type, chunk in self.client.chat(self.messages):
-                    if event_type == "text":
-                        final.append(chunk)
-                        yield chunk
-                
-                self.messages.append({"role": "assistant", "content": "".join(final)})
+        completed_resp: Response | None = None
+        with tracer.span("LLM-Reasoning-Phase"):
+            if self.client.capabilities.support_response_id:
+                stream_gen = self.client.create_response(
+                    input_items=[user_msg],
+                    instructions=self.system_prompt,
+                    previous_response_id=self.last_response_id,
+                )
             else:
-                self.messages.append({"role": "assistant", "content": "".join(reply)})
+                stream_gen = self.client.create_response(
+                    input_items=self.messages,
+                    instructions=self.system_prompt,
+                    previous_response_id=None,
+                )
 
-                        
-        except Exception as e:
-            self.messages.pop()
-            raise e
+            for event_type, chunk in stream_gen:
+                if event_type == "text":
+                    yield chunk
+                elif event_type == "completed":
+                    completed_resp = chunk
 
-
-    def clear(self):
-        self.messages.clear()
-        self.messages: list[dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
+        # 走出 LLM-Reasoning-Phase 之后再进入工具处理
+        if completed_resp:
+            if self.client.capabilities.support_response_id and getattr(completed_resp, "id", None):
+                self.last_response_id = completed_resp.id
+            yield from self._process_tools_and_respond(completed_resp)

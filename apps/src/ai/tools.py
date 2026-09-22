@@ -2,6 +2,7 @@
 import base64
 import os
 import json
+from ai.tracing import tracer
 
 def encode_image_to_base64(imagepath: str) -> str:
 
@@ -35,90 +36,81 @@ def adjust_sharpness(image_path: str, factor: float) -> str:
 TOOLS_SCHEMA = [
     {
         "type": "function",
-        "function": {
-            "name": "adjust_brightness",
-            "description": "调整指定图片的亮度。1.0 为原始亮度；>1.0 提亮（如 1.25）；<1.0 变暗（如 0.8）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_path": {
-                        "type": "string",
-                        "description": "图片的本地文件路径"
-                    },
-                    "factor": {
-                        "type": "number",
-                        "description": "亮度调整倍数，默认 1.0"
-                    }
+        "name": "adjust_brightness",
+        "description": "调整指定图片的亮度。1.0 为原始亮度；>1.0 提亮（如 1.25）；<1.0 变暗（如 0.8）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_path": {
+                    "type": "string",
+                    "description": "图片的本地文件路径"
                 },
-                "required": ["image_path", "factor"]
-            }
+                "factor": {
+                    "type": "number",
+                    "description": "亮度调整倍数，默认 1.0"
+                }
+            },
+            "required": ["image_path", "factor"]
         }
     },
     {
         "type": "function",
-        "function": {
-            "name": "adjust_contrast",
-            "description": "调整指定图片的明暗对比度。1.0 为原始对比度；>1.0 增强反差；<1.0 使画面平缓柔和。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_path": {
-                        "type": "string",
-                        "description": "图片的本地文件路径"
-                    },
-                    "factor": {
-                        "type": "number",
-                        "description": "对比度调整倍数，默认 1.0"
-                    }
+        "name": "adjust_contrast",
+        "description": "调整指定图片的明暗对比度。1.0 为原始对比度；>1.0 增强反差；<1.0 使画面平缓柔和。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_path": {
+                    "type": "string",
+                    "description": "图片的本地文件路径"
                 },
-                "required": ["image_path", "factor"]
-            }
+                "factor": {
+                    "type": "number",
+                    "description": "对比度调整倍数，默认 1.0"
+                }
+            },
+            "required": ["image_path", "factor"]
         }
     },
     {
         "type": "function",
-        "function": {
-            "name": "adjust_color",
-            "description": "调整指定图片的色彩饱和度。1.0 为原始色彩；>1.0 色彩更浓郁艳丽；<1.0 色彩更素雅或偏黑白。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_path": {
-                        "type": "string",
-                        "description": "图片的本地文件路径"
-                    },
-                    "factor": {
-                        "type": "number",
-                        "description": "色彩饱和度倍数，默认 1.0"
-                    }
+        "name": "adjust_color",
+        "description": "调整指定图片的色彩饱和度。1.0 为原始色彩；>1.0 色彩更浓郁艳丽；<1.0 色彩更素雅或偏黑白。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_path": {
+                    "type": "string",
+                    "description": "图片的本地文件路径"
                 },
-                "required": ["image_path", "factor"]
-            }
+                "factor": {
+                    "type": "number",
+                    "description": "色彩饱和度倍数，默认 1.0"
+                }
+            },
+            "required": ["image_path", "factor"]
         }
     },
     {
         "type": "function",
-        "function": {
-            "name": "adjust_sharpness",
-            "description": "调整指定图片的清晰度/锐度。1.0 为原始锐度；>1.0 提升画面细节和轮廓锐利度；<1.0 使画面柔焦朦胧。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_path": {
-                        "type": "string",
-                        "description": "图片的本地文件路径"
-                    },
-                    "factor": {
-                        "type": "number",
-                        "description": "清晰度调整倍数，默认 1.0"
-                    }
+        "name": "adjust_sharpness",
+        "description": "调整指定图片的清晰度/锐度。1.0 为原始锐度；>1.0 提升画面细节和轮廓锐利度；<1.0 使画面柔焦朦胧。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_path": {
+                    "type": "string",
+                    "description": "图片的本地文件路径"
                 },
-                "required": ["image_path", "factor"]
-            }
+                "factor": {
+                    "type": "number",
+                    "description": "清晰度调整倍数，默认 1.0"
+                }
+            },
+            "required": ["image_path", "factor"]
         }
     }
 ]
-
 
 AVAILABLE_TOOLS = {
     "adjust_brightness": adjust_brightness,
@@ -128,14 +120,16 @@ AVAILABLE_TOOLS = {
 }
 
 def ai_call_tool(tool: dict) -> str:
-    func = AVAILABLE_TOOLS[tool["name"]]
-    if not func:
-        return f"not find tool, tool name: {func}"
+    tool_name = tool.get("name", "")
+    with tracer.span(f"Tool-Execution:{tool_name}", raw_args=tool.get("arguments", "")) as span_info:
+        func = AVAILABLE_TOOLS.get(tool_name)
+        if not func:
+            return f"not find tool, tool name: {tool_name}"
 
-    try:
-        args = json.loads(tool["arguments"])
-    except Exception as e:
-        return f"parse arguments failed"
+        try:
+            args = json.loads(tool["arguments"])
+        except Exception as e:
+            return f"parse arguments failed"
 
-    res = func(**args)
-    return res
+        res = func(**args)
+        return res

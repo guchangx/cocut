@@ -59,7 +59,7 @@ def run():
                     continue
 
                 imgpath = parts[1]
-                prompt = parts[2] if len(parts) > 2 else DEFAULT_IMAGE_USER_PROMPT + "本地的图片路径： {imgpath}"
+                prompt = parts[2] if len(parts) > 2 else DEFAULT_IMAGE_USER_PROMPT + f"本地的图片路径： {imgpath}"
                 stream = session.stream_with_image(prompt, imgpath)
 
             elif inputstr == "/tree":
